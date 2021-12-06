@@ -1,1 +1,2 @@
-# nginx-active-probe
+# active-probe
+nginx-active-probe
