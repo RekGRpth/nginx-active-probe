@@ -38,19 +38,18 @@ typedef struct {
 } ngx_http_active_probe_main_conf_t;
 
 typedef struct ngx_http_active_probe_srv_conf_s {
-    ngx_pool_t                     *pool;
     ngx_str_t                       name;
     ngx_msec_t                      interval;
     ngx_msec_t                      timeout;
     ngx_uint_t                      protocol;
-    in_port_t                       port;
+    ngx_uint_t                      port;
     ngx_uint_t                      no_port;
     ngx_addr_t                     *addrs;
     ngx_uint_t                      naddrs;
     ngx_event_t                     probe_timer;
     ngx_event_t                     timeout_timer;
     ngx_peer_connection_t           pc;
-    ngx_http_upstream_srv_conf_t   *upstream;
+    ngx_http_upstream_srv_conf_t   *uscf;
 } ngx_http_active_probe_srv_conf_t;
 
 static ngx_command_t ngx_http_active_probe_commands[] = {
@@ -119,7 +118,7 @@ static char *ngx_http_active_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *con
         return NGX_CONF_ERROR;
     }
 
-    apscf->upstream = (ngx_http_upstream_srv_conf_t *)conf;
+    apscf->uscf = (ngx_http_upstream_srv_conf_t *)conf;
     /* Install the hello world handler. */
     value = cf->args->elts;
     interval = DEFAULT_PROBE_INTERVAL; 
@@ -230,7 +229,7 @@ ngx_http_active_probe_create_srv_conf(ngx_conf_t *cf)
     apscf->port = NGX_CONF_UNSET;
     apscf->protocol = NGX_CONF_UNSET_UINT;
     apscf->no_port = NGX_CONF_UNSET_UINT;
-    apscf->upstream = NGX_CONF_UNSET_PTR;
+    apscf->uscf = NGX_CONF_UNSET_PTR;
     apscf->addrs = NGX_CONF_UNSET_PTR;
     apscf->naddrs = NGX_CONF_UNSET_UINT;
 
@@ -242,7 +241,7 @@ ngx_http_active_probe_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_http_active_probe_srv_conf_t *prev = parent;
     ngx_http_active_probe_srv_conf_t *conf = child;
-    ngx_conf_merge_ptr_value(conf->upstream, prev->upstream, NULL);
+    ngx_conf_merge_ptr_value(conf->uscf, prev->uscf, NULL);
     ngx_conf_merge_uint_value(conf->interval, prev->interval, DEFAULT_PROBE_INTERVAL);
     ngx_conf_merge_uint_value(conf->timeout, prev->timeout, DEFAULT_PROBE_CONNECT_TIMEOUT);
     ngx_conf_merge_uint_value(conf->port, prev->port, DEFAULT_SERVER_PORT);
@@ -283,9 +282,14 @@ static void ngx_http_active_probe_recv_handler(ngx_event_t *ev)
 
 static void ngx_http_active_probe_send_handler(ngx_event_t *ev) 
 {
+#if 0
     ngx_connection_t                    *c;
+    size_t                              size;
     ngx_http_active_probe_srv_conf_t    *apscf;
-    ngx_http_upstream_srv_conf_t        *upstream;
+    ngx_http_upstream_srv_conf_t        *uscf;
+    ngx_chain_t                         out;
+    ngx_int_t                           rc;
+    ngx_slab_pool_t                     *shpool;
 
     c = ev->data;
     apscf = c->data;
@@ -295,13 +299,19 @@ static void ngx_http_active_probe_send_handler(ngx_event_t *ev)
     }
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "active probe send.");
-    upstream = apscf->upstream;
-    if (upstream == NULL) {
+    uscf = apscf->uscf;
+    if (uscf == NULL) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "no upstream is set.");
         return;
     }
-    /*loop all the peers and send them to the receiver*/
 
+    /*loop all the peers and send them to the receiver*/
+    /*TODO 1. calculate the size
+     *     2. allocate the buffer
+     *     3. send to the server*/
+
+    return;
+#endif
     return;
 }
 
@@ -417,7 +427,7 @@ static void ngx_http_active_probe_timer_handler(ngx_event_t *ev)
     c->sendfile = 0;
     c->read->log = c->log;
     c->write->log = c->log;
-    c->pool = apscf->pool;
+    c->pool = ngx_create_pool(ngx_pagesize, ngx_cycle->log);
 
 connection_done:
     c->write->handler = ngx_http_active_probe_send_handler;
@@ -457,7 +467,6 @@ ngx_http_active_probe_init_process(ngx_cycle_t *cycle)
             continue;
         }
         /*set up the timer for service*/
-        apscf[i].pool = ngx_create_pool(ngx_pagesize, cycle->log);
         probe_timer = &apscf[i].probe_timer;
         probe_timer->handler = ngx_http_active_probe_timer_handler;
         probe_timer->log = cycle->log;
