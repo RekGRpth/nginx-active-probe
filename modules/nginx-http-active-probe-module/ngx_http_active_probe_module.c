@@ -5,7 +5,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
-
+#include <ngx_http_upstream.h>
 
 #define DEFAULT_SERVER_PORT           5688
 #define DEFAULT_PROBE_INTERVAL        300
@@ -49,6 +49,7 @@ typedef struct ngx_http_active_probe_srv_conf_s {
     ngx_event_t                     probe_timer;
     ngx_event_t                     timeout_timer;
     ngx_peer_connection_t           pc;
+    ngx_buf_t                      *send_buf;
     ngx_http_upstream_srv_conf_t   *uscf;
 } ngx_http_active_probe_srv_conf_t;
 
@@ -107,9 +108,16 @@ static char *ngx_http_active_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *con
     ngx_uint_t                         i, port, protocol;
     ngx_url_t                          u;
     ngx_msec_t                         interval, timeout;
+    ngx_http_upstream_srv_conf_t  *uscf;
 
     apmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_active_probe_module);
     if (apmcf == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    uscf = ngx_http_conf_get_module_srv_conf(cf,
+                                              ngx_http_upstream_module);
+    if (uscf == NULL) {
         return NGX_CONF_ERROR;
     }
 
@@ -118,7 +126,7 @@ static char *ngx_http_active_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *con
         return NGX_CONF_ERROR;
     }
 
-    apscf->uscf = (ngx_http_upstream_srv_conf_t *)conf;
+    apscf->uscf = uscf;
     /* Install the hello world handler. */
     value = cf->args->elts;
     interval = DEFAULT_PROBE_INTERVAL; 
@@ -188,7 +196,7 @@ static char *ngx_http_active_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *con
 
     ngx_memzero(&u, sizeof(ngx_url_t));
     u.url = value[1];
-    u.default_port = DEFAULT_SERVER_PORT;
+    u.default_port = port;
 
     if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
         if (u.err) {
@@ -282,14 +290,15 @@ static void ngx_http_active_probe_recv_handler(ngx_event_t *ev)
 
 static void ngx_http_active_probe_send_handler(ngx_event_t *ev) 
 {
-#if 0
     ngx_connection_t                    *c;
-    size_t                              size;
+    ssize_t                              size;
     ngx_http_active_probe_srv_conf_t    *apscf;
     ngx_http_upstream_srv_conf_t        *uscf;
-    ngx_chain_t                         out;
+    ngx_buf_t                           *buf;
+#if 0
     ngx_int_t                           rc;
     ngx_slab_pool_t                     *shpool;
+#endif
 
     c = ev->data;
     apscf = c->data;
@@ -304,19 +313,42 @@ static void ngx_http_active_probe_send_handler(ngx_event_t *ev)
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "no upstream is set.");
         return;
     }
-
-    /*loop all the peers and send them to the receiver*/
-    /*TODO 1. calculate the size
-     *     2. allocate the buffer
-     *     3. send to the server*/
+    buf = apscf->send_buf;
+    if (buf == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "no buffer is set.");
+        return;
+    }
+    if (buf->pos == buf->last) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "no data needs to be sent.");
+        return;
+    }
+    while (buf->pos < buf->last) {
+        size = c->send(c, buf->pos, buf->last - buf->pos);
+        if (size > 0) {
+            buf->pos += size;
+        } else if (size == 0 || size == NGX_AGAIN) {
+            return;
+        } else {
+            c->error = 1;
+            ngx_log_error(NGX_LOG_ERR, c->log, 0, "send buffer error.");
+            goto send_fail;
+        }
+    }
+    if (buf->pos == buf->last) {
+        buf->pos = buf->start;
+        buf->last = buf->start;
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0, "send finished.");
+    }
 
     return;
-#endif
+send_fail:
+    /*TODO clean up the resources include the connection and timers.*/
     return;
 }
 
 static void ngx_http_active_probe_clear_event(ngx_http_active_probe_srv_conf_t *apscf)
 {
+#if 0
     ngx_connection_t                    *c;
 
     if (apscf == NULL || apscf->addrs == NULL || apscf->naddrs == 0) {
@@ -333,7 +365,7 @@ static void ngx_http_active_probe_clear_event(ngx_http_active_probe_srv_conf_t *
     if (apscf->timeout_timer.timer_set) {
         ngx_del_timer(&apscf->timeout_timer);
     }
-
+#endif
     return;
 }
 
@@ -377,17 +409,60 @@ ngx_http_active_probe_peek_one_byte(ngx_connection_t *c)
     }
 }
 
+static void ngx_http_active_probe_fill_data(ngx_buf_t *buf, ngx_http_upstream_srv_conf_t *uscf)
+{
+    ngx_http_upstream_rr_peers_t *peers;
+    ngx_http_upstream_rr_peer_t  *peer;
+    size_t                       size;
+    ngx_uint_t                   index=0;
+
+    peers = (ngx_http_upstream_rr_peers_t *)uscf->peer.data;
+    size = buf->end - buf->last;
+    ngx_http_upstream_rr_peers_rlock(peers);
+    buf->last = ngx_snprintf(buf->last, size, "{\"%V\" : {\"peers\" : [ ", peers->name);
+    for (peer = peers->peer; peer != NULL; peer = peer->next) {
+        size = buf->end - buf->last;
+#if 0
+        buf->last = ngx_snprintf(buf->last, ngx_pagesize/64,
+                "{\"server\" : \"%V\", \"name\" : \"%V\"},", &peer->server, &peer->name);
+#endif
+        if (index == 0) {
+            buf->last = ngx_snprintf(buf->last, ngx_pagesize/64,
+                    "{\"server\" : \"%V\"}", &peer->name);
+        } else {
+            buf->last = ngx_snprintf(buf->last, ngx_pagesize/64,
+                    ",{\"server\" : \"%V\"}", &peer->name);
+       }
+       index ++;
+    }
+    ngx_http_upstream_rr_peers_unlock(peers);
+    size = buf->end - buf->last;
+    buf->last = ngx_snprintf(buf->last, size, " ]},");
+    size = buf->end - buf->last;
+    buf->last = ngx_snprintf(buf->last, size, "{\"protocol\" : \"TCP\"}}\n");
+    
+    return;
+}
+#define TEST "1234567890\n"
 /*timer handler*/
 static void ngx_http_active_probe_timer_handler(ngx_event_t *ev)
 {
     ngx_int_t                            rc;
     ngx_connection_t                    *c;
     ngx_http_active_probe_srv_conf_t    *apscf;
+    ngx_buf_t                           *buf;
+    ngx_http_upstream_srv_conf_t        *uscf;
 
     apscf = ev->data;
     if (apscf == NULL || apscf->addrs == NULL || apscf->naddrs == 0) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0, "no valid data");
         return;   
+    }
+
+    uscf = apscf->uscf;
+    if (uscf == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0, "no upstream data");
+        return;
     }
 
     ngx_add_timer(ev, apscf->interval);
@@ -434,6 +509,28 @@ connection_done:
     c->read->handler = ngx_http_active_probe_recv_handler;
     ngx_add_timer(&apscf->timeout_timer, apscf->timeout);
 
+    /*loop all the peers and send them to the receiver*/
+    /*TODO 1. calculate the size
+     *     2. allocate the buffer
+     *     3. send to the server*/
+    if (apscf->send_buf == NULL) {
+        apscf->send_buf = ngx_create_temp_buf(c->pool,ngx_pagesize/2);
+        if (apscf->send_buf == NULL) {
+            /*TODO clean up the resource*/
+            /*The resources include the connection and the timers*/
+            ngx_log_error(NGX_LOG_ERR, c->log, 0, "create buffer error.");
+            return;
+        }
+    }
+
+    buf = apscf->send_buf;
+    if (buf->pos == buf->last) {
+        buf->pos = buf->start;
+        buf->last = buf->start;
+        /*Copy the string into the buf*/
+        //buf->last = ngx_snprintf(buf->last, ngx_strlen(TEST), TEST);
+        ngx_http_active_probe_fill_data(buf, uscf);
+    }
     if (rc == NGX_OK) {
         c->write->handler(c->write);
     }
