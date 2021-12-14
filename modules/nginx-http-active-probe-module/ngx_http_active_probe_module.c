@@ -173,7 +173,7 @@ static char *ngx_http_active_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *con
            s.len = value[i].len - 9;
            s.data = value[i].data + 9;
             
-           if (ngx_strncmp(s.data,  (u_char *)"ICMP", 4) == 0) {
+           if (ngx_strncasecmp(s.data,  (u_char *)"ICMP", 4) == 0) {
                protocol = NGX_ACTIVE_PROBE_ICMP;
            } else if (ngx_strncasecmp(s.data,  (u_char *)"TCP", 3) == 0) {
                protocol = NGX_ACTIVE_PROBE_TCP;
@@ -409,13 +409,17 @@ ngx_http_active_probe_peek_one_byte(ngx_connection_t *c)
     }
 }
 
-static void ngx_http_active_probe_fill_data(ngx_buf_t *buf, ngx_http_upstream_srv_conf_t *uscf)
+static void ngx_http_active_probe_fill_data(ngx_buf_t *buf, ngx_http_active_probe_srv_conf_t *apscf)
 {
-    ngx_http_upstream_rr_peers_t *peers;
-    ngx_http_upstream_rr_peer_t  *peer;
-    size_t                       size;
-    ngx_uint_t                   index=0;
+    ngx_http_upstream_rr_peers_t        *peers;
+    ngx_http_upstream_rr_peer_t         *peer;
+    size_t                              size;
+    ngx_uint_t                          index=0;
+    char                                *protocol;
+    ngx_http_upstream_srv_conf_t        *uscf;
 
+
+    uscf = apscf->uscf;
     peers = (ngx_http_upstream_rr_peers_t *)uscf->peer.data;
     size = buf->end - buf->last;
     ngx_http_upstream_rr_peers_rlock(peers);
@@ -439,7 +443,30 @@ static void ngx_http_active_probe_fill_data(ngx_buf_t *buf, ngx_http_upstream_sr
     size = buf->end - buf->last;
     buf->last = ngx_snprintf(buf->last, size, " ]},");
     size = buf->end - buf->last;
-    buf->last = ngx_snprintf(buf->last, size, "{\"protocol\" : \"TCP\"}}\n");
+    switch(apscf->protocol) {
+        case NGX_ACTIVE_PROBE_ICMP:
+            protocol = "ICMP";
+            break;
+        case NGX_ACTIVE_PROBE_TCP:
+            protocol = "TCP";
+            break;
+        case NGX_ACTIVE_PROBE_UDP:
+            protocol = "UDP";
+            break;
+        case NGX_ACTIVE_PROBE_HTTP:
+            protocol = "HTTP";
+            break;
+        case NGX_ACTIVE_PROBE_HTTPS:
+            protocol = "HTTPS";
+            break;
+        case NGX_ACTIVE_PROBE_DNS:
+            protocol = "DNS";
+            break;
+        default:
+            protocol = "NONE";
+            break;
+    }
+    buf->last = ngx_snprintf(buf->last, size, "{\"protocol\" : \"%s\"}}\n", protocol);
     
     return;
 }
@@ -529,7 +556,7 @@ connection_done:
         buf->last = buf->start;
         /*Copy the string into the buf*/
         //buf->last = ngx_snprintf(buf->last, ngx_strlen(TEST), TEST);
-        ngx_http_active_probe_fill_data(buf, uscf);
+        ngx_http_active_probe_fill_data(buf, apscf);
     }
     if (rc == NGX_OK) {
         c->write->handler(c->write);
